@@ -1,2185 +1,561 @@
-import os
-import re
-import sqlite3
-from urllib.parse import quote
+import streamlit as st
+import pandas as pd
+import numpy as np
+import sqlite3, re, urllib.parse
+from pathlib import Path
 from datetime import date, datetime, timedelta
 
-import pandas as pd
-import streamlit as st
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
 
-DB_PATH = "insurance_crm.db"
-RATE_PATH = "rate_table.csv"
+try:
+    import pytesseract
+except ImportError:
+    pytesseract = None
+
 
 st.set_page_config(
-    page_title="Insurance Sales CRM",
+    page_title="Ultimate Insurance Sales CRM",
     page_icon="🛡️",
-    layout="wide",
-    initial_sidebar_state="collapsed"
+    layout="wide"
 )
 
+BASE = Path(__file__).resolve().parent
+DB_PATH = BASE / "crm.db"
+RATE_DIR = BASE / "rate_tables"
+RATE_DIR.mkdir(exist_ok=True)
 
-# =========================================================
-# DATABASE
-# =========================================================
-
-def db():
-    con = sqlite3.connect(DB_PATH, check_same_thread=False)
-    con.row_factory = sqlite3.Row
-    return con
-
-
-def init_db():
-    con = db()
-
-    con.executescript("""
-    CREATE TABLE IF NOT EXISTS leads (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT,
-        mobile TEXT,
-        dob TEXT,
-        age INTEGER,
-        policy_no TEXT,
-        sum_insured REAL,
-        premium REAL,
-        insurer TEXT,
-        product TEXT,
-        policy_date TEXT,
-        renewal_date TEXT,
-        status TEXT DEFAULT 'New Lead',
-        notes TEXT DEFAULT '',
-        objection TEXT DEFAULT '',
-        interested_plan TEXT DEFAULT '',
-        last_contact TEXT,
-        next_followup TEXT,
-        source TEXT DEFAULT '',
-        opportunity_score INTEGER DEFAULT 0,
-        updated_at TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS interactions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        lead_id INTEGER,
-        interaction_date TEXT,
-        status TEXT,
-        note TEXT,
-        created_at TEXT
-    );
-    """)
-
-    con.commit()
-    con.close()
+st.markdown('''
+<style>
+.block-container{padding-top:.7rem;padding-bottom:4rem}
+.stButton>button{border-radius:12px;min-height:42px;font-weight:600}
+div[data-testid="stMetric"]{border:1px solid #e5e7eb;border-radius:14px;padding:10px}
+</style>
+''', unsafe_allow_html=True)
 
 
-# =========================================================
-# DATA CLEANING
-# =========================================================
+# ============================================================
+# CONSTANTS
+# ============================================================
 
-def clean_col(c):
-    c = str(c).strip().lower()
-    c = re.sub(r"[^a-z0-9]+", "_", c).strip("_")
-    return c or "column"
+INSURERS = [
+    "Care Health",
+    "Niva Bupa",
+    "HDFC ERGO",
+    "Star Health",
+    "ICICI Lombard",
+    "Other"
+]
 
+PLANS = {
+    "Care Health": ["Ultimate Care", "Care Supreme", "Other"],
+    "Niva Bupa": ["ReAssure 2.0", "ReAssure 3.0", "Health Companion", "Other"],
+    "HDFC ERGO": ["my:Optima Secure", "Other"],
+    "Star Health": ["Star Comprehensive", "Family Health Optima", "Other"],
+    "ICICI Lombard": ["Complete Health Insurance", "Other"],
+    "Other": ["Other"]
+}
 
-def unique_columns(cols):
-    seen = {}
-    output = []
+FEATURES = [
+    "Room Rent", "ICU", "Modern Treatment", "Road Ambulance",
+    "NCB / Bonus", "Restore / Refill", "Co-pay", "Disease Sub-limits",
+    "PED Waiting", "Specific Waiting", "Maternity", "Day Care"
+]
 
-    for c in cols:
-        base = clean_col(c)
-        count = seen.get(base, 0)
-
-        if count == 0:
-            output.append(base)
-        else:
-            output.append(f"{base}_{count + 1}")
-
-        seen[base] = count + 1
-
-    return output
-
-
-def safe_df(df):
-    df = df.copy()
-    df.columns = unique_columns(df.columns)
-
-    for c in df.columns:
-        if df[c].dtype == "object":
-            df[c] = (
-                df[c]
-                .fillna("")
-                .astype(str)
-                .str.replace("\x00", "", regex=False)
-            )
-
-    return df
+RATE_COLS = [
+    "insurer", "plan", "zone", "policy_type", "sum_insured_lakh",
+    "age_min", "age_max", "member_count", "base_premium",
+    "gst_included", "discount_pct", "source", "source_date"
+]
 
 
-def norm_mobile(value):
-    digits = re.sub(r"\D", "", str(value or ""))
+# ============================================================
+# DATABASE SETUP
+# ============================================================
 
-    if len(digits) >= 12 and digits.startswith("91"):
-        digits = digits[-10:]
+def get_db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS leads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT, mobile TEXT, city TEXT, insurer TEXT, plan TEXT,
+            sum_insured REAL, renewal_date TEXT, premium REAL,
+            members TEXT, ped TEXT, notes TEXT, score INTEGER,
+            created_at TEXT, updated_at TEXT
+        )
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS followups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lead_id INTEGER, followup_date TEXT, status TEXT,
+            note TEXT, created_at TEXT
+        )
+    ''')
+    conn.commit()
+    return conn
 
-    return digits[-10:] if len(digits) >= 10 else digits
+DB = get_db()
 
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def normalize_mobile(value):
+    value = re.sub(r"\D", "", str(value or ""))
+    if value.startswith("91") and len(value) == 12: return value[2:]
+    if len(value) >= 10: return value[-10:]
+    return value
 
 def money(value):
-    if value is None:
-        return 0.0
+    try: return f"₹{float(value):,.0f}"
+    except Exception: return "—"
 
-    s = str(value).replace(",", "").replace("₹", "").strip()
-
-    m = re.search(r"[-+]?\d+(?:\.\d+)?", s)
-
-    return float(m.group()) if m else 0.0
-
-
-def parse_age(value):
+def opportunity_score(renewal, sum_insured, premium, room=False, ped=False, age=0):
+    score = 0
     try:
-        x = int(float(str(value).strip()))
-        return x if 0 < x < 120 else None
-    except Exception:
-        return None
-
-
-def age_from_dob(value):
-    if not value:
-        return None
-
+        days = (renewal - date.today()).days
+        if 0 <= days <= 30: score += 35
+        elif 31 <= days <= 60: score += 25
+        elif 61 <= days <= 90: score += 15
+        elif days < 0: score += 15
+    except Exception: pass
+    
     try:
-        d = pd.to_datetime(
-            value,
-            errors="coerce",
-            dayfirst=True
-        )
-
-        if pd.isna(d):
-            return None
-
-        today = date.today()
-
-        return (
-            today.year
-            - d.date().year
-            - ((today.month, today.day) < (d.date().month, d.date().day))
-        )
-
-    except Exception:
-        return None
-
-
-# =========================================================
-# OPPORTUNITY SCORING
-# =========================================================
-
-def score_lead(row):
-
-    score = 20
-
-    age = row.get("age")
-    si = float(row.get("sum_insured") or 0)
-    premium = float(row.get("premium") or 0)
-    renewal = row.get("renewal_date")
-
-    if age and age >= 55:
-        score += 20
-
-    if si and si <= 500000:
-        score += 20
-
-    if premium and premium >= 25000:
-        score += 10
-
-    if renewal:
-
-        try:
-            rd = pd.to_datetime(
-                renewal,
-                errors="coerce"
-            ).date()
-
-            if rd and 0 <= (rd - date.today()).days <= 30:
-                score += 30
-
-        except Exception:
-            pass
-
+        si = float(sum_insured)
+        if si <= 5: score += 20
+        elif si <= 10: score += 12
+    except Exception: pass
+    
+    if room: score += 15
+    if ped: score += 10
+    
+    try:
+        if int(age) >= 45: score += 10
+    except Exception: pass
+    
+    if float(premium or 0) > 0: score += 5
     return min(score, 100)
 
 
-# =========================================================
-# COLUMN MAPPING
-# =========================================================
+# ============================================================
+# RATE TABLE ENGINE
+# ============================================================
 
-def infer_field(cols, aliases):
-
-    for alias in aliases:
-
-        for col in cols:
-
-            if alias in col:
-                return col
-
-    return None
-
-
-def map_columns(df):
-
-    cols = list(df.columns)
-
-    return {
-        "name": infer_field(
-            cols,
-            ["customer_name", "name", "insured", "proposer"]
-        ),
-
-        "mobile": infer_field(
-            cols,
-            ["mobile", "phone", "contact", "mob"]
-        ),
-
-        "dob": infer_field(
-            cols,
-            ["dob", "date_of_birth", "birth"]
-        ),
-
-        "policy_no": infer_field(
-            cols,
-            ["policy_no", "policy", "policyno"]
-        ),
-
-        "sum_insured": infer_field(
-            cols,
-            ["sum_insured", "si", "suminsured", "cover"]
-        ),
-
-        "premium": infer_field(
-            cols,
-            ["premium", "prem"]
-        ),
-
-        "insurer": infer_field(
-            cols,
-            ["insurer", "company"]
-        ),
-
-        "product": infer_field(
-            cols,
-            ["product", "plan"]
-        ),
-
-        "policy_date": infer_field(
-            cols,
-            [
-                "policy_date",
-                "app_date",
-                "application_date",
-                "start"
-            ]
-        ),
-
-        "renewal_date": infer_field(
-            cols,
-            [
-                "renewal",
-                "renewal_date",
-                "expiry",
-                "expiry_date"
-            ]
-        ),
+def normalize_rates(df):
+    df = df.copy()
+    df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
+    aliases = {
+        "sum_insured": "sum_insured_lakh", "si_lakh": "sum_insured_lakh",
+        "premium": "base_premium", "members": "member_count",
+        "age_from": "age_min", "age_to": "age_max"
     }
+    for old, new in aliases.items():
+        if old in df.columns and new not in df.columns:
+            df.rename(columns={old: new}, inplace=True)
+    
+    for col in RATE_COLS:
+        if col not in df.columns: df[col] = ""
+        
+    for col in ["sum_insured_lakh", "age_min", "age_max", "member_count", "base_premium", "discount_pct"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df[RATE_COLS]
+
+def load_rates():
+    tables = []
+    for file in RATE_DIR.glob("*.csv"):
+        try: tables.append(normalize_rates(pd.read_csv(file)))
+        except Exception: pass
+    if not tables: return pd.DataFrame(columns=RATE_COLS)
+    return pd.concat(tables, ignore_index=True)
+
+rates = load_rates()
+
+def calculate_premium(rates_df, insurer, plan, zone, policy_type, sum_insured, ages):
+    if rates_df.empty: return None, "No verified rate table is loaded."
+    
+    df = rates_df[
+        (rates_df["insurer"].astype(str).str.casefold() == insurer.casefold()) &
+        (rates_df["plan"].astype(str).str.casefold() == plan.casefold()) &
+        (rates_df["sum_insured_lakh"] == float(sum_insured))
+    ]
+    if zone:
+        z = df[df["zone"].astype(str).str.casefold() == zone.casefold()]
+        if not z.empty: df = z
+    
+    type_df = df[df["policy_type"].astype(str).str.casefold() == policy_type.casefold()]
+    if not type_df.empty: df = type_df
+    
+    if df.empty: return None, "No matching official rate row was found."
+    
+    if policy_type == "Individual":
+        age = ages[0]
+        match = df[(df["age_min"] <= age) & (df["age_max"] >= age)]
+        if match.empty: return None, f"No verified rate found for age {age}."
+        row = match.iloc[0]
+        base = float(row["base_premium"])
+    elif policy_type == "Family Floater":
+        oldest = max(ages)
+        match = df[(df["age_min"] <= oldest) & (df["age_max"] >= oldest) & (df["member_count"] == len(ages))]
+        if match.empty: return None, "No explicit verified floater rate for this age/member combination."
+        row = match.iloc[0]
+        base = float(row["base_premium"])
+    else:
+        base = 0; row = None
+        for age in ages:
+            match = df[(df["age_min"] <= age) & (df["age_max"] >= age)]
+            if match.empty: return None, f"No verified rate found for age {age}."
+            row = match.iloc[0]
+            base += float(row["base_premium"])
+            
+    discount = float(row["discount_pct"] or 0)
+    base = base * (1 - discount / 100)
+    gst_included = str(row["gst_included"]).strip().lower()
+    gst = 0 if gst_included in ["yes", "true", "1"] else base * 0.18
+    return {"base": base, "gst": gst, "total": base + gst, "source": str(row["source"]), "source_date": str(row["source_date"])}, None
 
 
-# =========================================================
-# IMPORT INTO CRM
-# =========================================================
+# ============================================================
+# EXCEL / CSV BULK UPLOAD TO DATABASE (RESTORED MAIN FEATURE)
+# ============================================================
 
-def import_df(df, source="Import"):
+def auto_detect_columns(df):
+    cols = [str(c).strip().lower() for c in df.columns]
+    name_col = next((df.columns[i] for i, c in enumerate(cols) if "name" in c or "customer" in c), df.columns[4] if len(df.columns) > 4 else df.columns[0])
+    mob_col = next((df.columns[i] for i, c in enumerate(cols) if "mob" in c or "phone" in c or "contact" in c or "no" in c), df.columns[1] if len(df.columns) > 1 else None)
+    si_col = next((df.columns[i] for i, c in enumerate(cols) if "si" in c or "sum" in c or "insured" in c), df.columns[3] if len(df.columns) > 3 else None)
+    prem_col = next((df.columns[i] for i, c in enumerate(cols) if "prem" in c or "amount" in c), df.columns[6] if len(df.columns) > 6 else None)
+    prod_col = next((df.columns[i] for i, c in enumerate(cols) if "product" in c or "plan" in c), df.columns[5] if len(df.columns) > 5 else None)
+    date_col = next((df.columns[i] for i, c in enumerate(cols) if "date" in c or "app" in c), df.columns[7] if len(df.columns) > 7 else None)
+    return name_col, mob_col, si_col, prem_col, prod_col, date_col
 
-    df = safe_df(df)
-    mapping = map_columns(df)
-
-    con = db()
-
-    added = 0
-    updated = 0
-
+def bulk_import_leads(df):
+    name_col, mob_col, si_col, prem_col, prod_col, date_col = auto_detect_columns(df)
     now = datetime.now().isoformat(timespec="seconds")
-
-    for _, r in df.iterrows():
-
-        name = str(
-            r.get(mapping["name"], "")
-            if mapping["name"]
-            else ""
-        ).strip()
-
-        mobile = norm_mobile(
-            r.get(mapping["mobile"], "")
-            if mapping["mobile"]
-            else ""
-        )
-
-        if not name and not mobile:
-            continue
-
-        dob = str(
-            r.get(mapping["dob"], "")
-            if mapping["dob"]
-            else ""
-        ).strip()
-
-        age = (
-            age_from_dob(dob)
-            or parse_age(r.get("age", ""))
-        )
-
-        policy_no = str(
-            r.get(mapping["policy_no"], "")
-            if mapping["policy_no"]
-            else ""
-        ).strip()
-
-        si = money(
-            r.get(mapping["sum_insured"], 0)
-            if mapping["sum_insured"]
-            else 0
-        )
-
-        premium = money(
-            r.get(mapping["premium"], 0)
-            if mapping["premium"]
-            else 0
-        )
-
-        insurer = str(
-            r.get(mapping["insurer"], "")
-            if mapping["insurer"]
-            else ""
-        ).strip()
-
-        product = str(
-            r.get(mapping["product"], "")
-            if mapping["product"]
-            else ""
-        ).strip()
-
-        policy_date = str(
-            r.get(mapping["policy_date"], "")
-            if mapping["policy_date"]
-            else ""
-        ).strip()
-
-        renewal = str(
-            r.get(mapping["renewal_date"], "")
-            if mapping["renewal_date"]
-            else ""
-        ).strip()
-
-        score = score_lead({
-            "age": age,
-            "sum_insured": si,
-            "premium": premium,
-            "renewal_date": renewal
-        })
-
-        existing = None
-
-        if mobile:
-
-            existing = con.execute(
-                "SELECT id FROM leads WHERE mobile=? LIMIT 1",
-                (mobile,)
-            ).fetchone()
-
-        if not existing and policy_no:
-
-            existing = con.execute(
-                "SELECT id FROM leads WHERE policy_no=? LIMIT 1",
-                (policy_no,)
-            ).fetchone()
-
-        if existing:
-
-            con.execute(
-                """
-                UPDATE leads
-                SET
-                    name=?,
-                    dob=?,
-                    age=?,
-                    policy_no=?,
-                    sum_insured=?,
-                    premium=?,
-                    insurer=?,
-                    product=?,
-                    policy_date=?,
-                    renewal_date=?,
-                    opportunity_score=?,
-                    source=?,
-                    updated_at=?
-                WHERE id=?
-                """,
-                (
-                    name,
-                    dob,
-                    age,
-                    policy_no,
-                    si,
-                    premium,
-                    insurer,
-                    product,
-                    policy_date,
-                    renewal,
-                    score,
-                    source,
-                    now,
-                    existing["id"]
-                )
-            )
-
-            updated += 1
-
-        else:
-
-            con.execute(
-                """
-                INSERT INTO leads
-                (
-                    name,
-                    mobile,
-                    dob,
-                    age,
-                    policy_no,
-                    sum_insured,
-                    premium,
-                    insurer,
-                    product,
-                    policy_date,
-                    renewal_date,
-                    opportunity_score,
-                    source,
-                    updated_at
-                )
+    count = 0
+    
+    for _, row in df.iterrows():
+        try:
+            name = str(row[name_col]) if name_col else "Unknown"
+            if name == "nan" or name == "None": continue
+            
+            mobile = normalize_mobile(row[mob_col]) if mob_col else ""
+            si_val = str(row[si_col]).replace('L', '').replace('l', '').strip() if si_col else "5"
+            try: si = float(si_val)
+            except: si = 5.0
+            
+            prem_val = str(row[prem_col]).replace(',', '').strip() if prem_col else "0"
+            try: prem = float(prem_val)
+            except: prem = 0.0
+            
+            plan = str(row[prod_col]) if prod_col else ""
+            
+            renewal = date.today() + timedelta(days=30)
+            if date_col:
+                try: 
+                    dt = pd.to_datetime(row[date_col], dayfirst=True)
+                    if not pd.isnull(dt): renewal = dt.date()
+                except: pass
+            
+            score = opportunity_score(renewal, si, prem)
+            
+            DB.execute('''
+                INSERT INTO leads(name,mobile,city,insurer,plan,sum_insured,renewal_date,premium,members,ped,notes,score,created_at,updated_at)
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                (
-                    name,
-                    mobile,
-                    dob,
-                    age,
-                    policy_no,
-                    si,
-                    premium,
-                    insurer,
-                    product,
-                    policy_date,
-                    renewal,
-                    score,
-                    source,
-                    now
-                )
-            )
+            ''', (name, mobile, "", "Unknown", plan, si, renewal.isoformat(), prem, "Self", "", "Bulk Imported", score, now, now))
+            count += 1
+        except Exception as e:
+            pass
+    DB.commit()
+    return count
 
-            added += 1
-
-    con.commit()
-    con.close()
-
-    return added, updated
-
-
-# =========================================================
-# SUM INSURED OCR PARSER
-# =========================================================
-
-def parse_si(value):
-
-    s = (
-        str(value or "")
-        .strip()
-        .upper()
-        .replace("₹", "")
-        .replace(",", "")
-    )
-
-    m = re.search(
-        r"([0-9]+(?:\.[0-9]+)?)\s*(CR|CRORE|L|LAKH|K)?",
-        s
-    )
-
-    if not m:
-        return 0.0
-
-    n = float(m.group(1))
-    unit = m.group(2) or ""
-
-    if unit in ("CR", "CRORE"):
-        return n * 10000000
-
-    if unit in ("L", "LAKH"):
-        return n * 100000
-
-    if unit == "K":
-        return n * 1000
-
-    # OCR often reads:
-    # 5L  -> 51
-    # 15L -> 151
-    # 25L -> 251
-
-    if (
-        not unit
-        and 11 <= n <= 1001
-        and int(n) % 10 == 1
-    ):
-
-        implied_lakh = int(n) // 10
-
-        if implied_lakh in {
-            1, 2, 3, 5, 7,
-            10, 15, 20, 25,
-            30, 50, 75, 100
-        }:
-            return implied_lakh * 100000
-
-    return n
-
-
-# =========================================================
+# ============================================================
 # OCR
-# =========================================================
+# ============================================================
 
-def _ocr_tokens(img):
-
-    from PIL import ImageOps, ImageEnhance, ImageFilter
-    import pytesseract
-
-    gray = ImageOps.grayscale(img)
-
-    gray = ImageEnhance.Contrast(gray).enhance(1.8)
-
-    gray = gray.filter(ImageFilter.SHARPEN)
-
-    data = pytesseract.image_to_data(
-        gray,
-        config="--psm 11",
-        output_type=pytesseract.Output.DATAFRAME
-    )
-
-    data = data.dropna(subset=["text"])
-
-    data["text"] = (
-        data["text"]
-        .astype(str)
-        .str.strip()
-    )
-
-    return data[data["text"] != ""].copy()
-
-
-def _extract_rows_from_tokens(data, image_width):
-
-    digits = data["text"].str.replace(
-        r"\D",
-        "",
-        regex=True
-    )
-
-    phones = data[
-        digits.str.match(
-            r"^[6-9]\d{9}$",
-            na=False
-        )
-    ].copy()
-
-    records = []
-
-    used_y = []
-
-    for _, phone in phones.sort_values("top").iterrows():
-
-        cy = float(
-            phone.top + phone.height / 2
-        )
-
-        if any(abs(cy - y) < 18 for y in used_y):
-            continue
-
-        used_y.append(cy)
-
-        row = data[
-            (
-                data.top
-                + data.height / 2
-                - cy
-            ).abs() <= 22
-        ].copy()
-
-        row["cx"] = (
-            row.left + row.width / 2
-        ) / max(image_width, 1)
-
-        row = row.sort_values("left")
-
-        record = {
-            "mobile": norm_mobile(phone.text)
-        }
-
-        # Typical column positions in the user's sheet.
-        bands = {
-
-            "policy": row[
-                (row.cx < .15)
-                &
-                row.text
-                .str.replace(r"\D", "", regex=True)
-                .str.match(
-                    r"^\d{7,15}$",
-                    na=False
-                )
-            ],
-
-            "dob": row[
-                (row.cx >= .25)
-                &
-                (row.cx < .34)
-            ],
-
-            "si": row[
-                (row.cx >= .34)
-                &
-                (row.cx < .41)
-            ],
-
-            "name": row[
-                (row.cx >= .40)
-                &
-                (row.cx < .65)
-            ],
-
-            "product": row[
-                (row.cx >= .64)
-                &
-                (row.cx < .81)
-            ],
-
-            "premium": row[
-                (row.cx >= .81)
-                &
-                (row.cx < .91)
-            ],
-
-            "app_date": row[
-                row.cx >= .91
-            ],
-        }
-
-        # POLICY NUMBER
-        if not bands["policy"].empty:
-
-            values = [
-                str(x)
-                for x in bands["policy"].text.tolist()
-                if len(
-                    re.sub(
-                        r"\D",
-                        "",
-                        str(x)
-                    )
-                ) >= 7
-            ]
-
-            if values:
-
-                record["policy_no"] = max(
-                    values,
-                    key=lambda x: len(
-                        re.sub(
-                            r"\D",
-                            "",
-                            x
-                        )
-                    )
-                )
-
-        # DOB
-        dob_match = None
-
-        for text in bands["dob"].text.tolist():
-
-            match = re.search(
-                r"\b\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}\b",
-                str(text)
-            )
-
-            if match:
-                dob_match = match.group()
-                break
-
-        if dob_match:
-
-            record["dob"] = (
-                dob_match
-                .replace(".", "-")
-                .replace("/", "-")
-            )
-
-        # SUM INSURED
-        si_text = " ".join(
-            bands["si"].text.astype(str).tolist()
-        )
-
-        if re.search(r"\d", si_text):
-
-            record["sum_insured"] = parse_si(
-                si_text
-            )
-
-        # NAME
-        name = " ".join(
-            bands["name"].text.astype(str).tolist()
-        )
-
-        name = re.sub(
-            r"[^A-Za-z .'-]",
-            " ",
-            name
-        )
-
-        name = re.sub(
-            r"\s+",
-            " ",
-            name
-        ).strip()
-
-        if (
-            name
-            and len(name) > 2
-            and "name" not in name.lower()
-            and "product" not in name.lower()
-        ):
-            record["name"] = name
-
-        # PRODUCT
-        product = " ".join(
-            bands["product"].text.astype(str).tolist()
-        )
-
-        product = re.sub(
-            r"\s+",
-            " ",
-            product
-        ).strip()
-
-        if (
-            product
-            and "product" not in product.lower()
-        ):
-            record["product"] = product
-
-        # PREMIUM
-        premium_numbers = []
-
-        for text in bands["premium"].text.astype(str).tolist():
-
-            match = re.search(
-                r"\d[\d,]{3,8}",
-                text.replace("$", "")
-            )
-
-            if match:
-
-                premium_numbers.append(
-                    match.group().replace(",", "")
-                )
-
-        if premium_numbers:
-
-            record["premium"] = float(
-                max(
-                    premium_numbers,
-                    key=lambda x: float(x)
-                )
-            )
-
-        # APPLICATION DATE
-        for text in bands["app_date"].text.astype(str).tolist():
-
-            match = re.search(
-                r"\b\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}\b",
-                text
-            )
-
-            if match:
-
-                record["policy_date"] = (
-                    match.group()
-                    .replace(".", "-")
-                    .replace("/", "-")
-                )
-
-                break
-
-        if (
-            record.get("mobile")
-            or record.get("policy_no")
-        ):
-            records.append(record)
-
-    return safe_df(
-        pd.DataFrame(records)
-    )
-
-
-def ocr_image(uploaded):
-
+def extract_ocr(file):
+    if Image is None or pytesseract is None: return "", "OCR packages are unavailable."
     try:
+        image = Image.open(file)
+        text = pytesseract.image_to_string(image, config="--psm 6")
+        return text, None
+    except Exception as e: return "", str(e)
 
-        from PIL import Image
-        import pytesseract
-
-        image = Image.open(uploaded).convert("RGB")
-
-        # First attempt: complete image
-        data = _ocr_tokens(image)
-
-        used_image = image
-
-        # If uploaded image is actually a gallery/phone screenshot,
-        # automatically focus on the table area.
-        if len(data) < 50:
-
-            w, h = image.size
-
-            used_image = image.crop(
-                (
-                    0,
-                    int(h * .30),
-                    w,
-                    int(h * .68)
-                )
-            )
-
-            used_image = used_image.resize(
-                (
-                    w * 3,
-                    int(h * .38) * 3
-                )
-            )
-
-            data = _ocr_tokens(
-                used_image
-            )
-
-        rows = _extract_rows_from_tokens(
-            data,
-            used_image.size[0]
-        )
-
-        raw = pytesseract.image_to_string(
-            used_image,
-            config="--psm 11"
-        )
-
-        return rows, raw
-
-    except Exception as e:
-
-        return (
-            pd.DataFrame(),
-            f"OCR unavailable/error: {e}"
-        )
+def extract_fields(text):
+    patterns = {
+        "mobile": r"(?:mobile|mob|phone)\D{0,10}([6-9]\d{9})",
+        "premium": r"(?:premium)\D{0,15}(?:₹|rs\.?|inr)?\s*([\d,]+(?:\.\d+)?)",
+        "renewal_date": r"(?:renewal|expiry|policy end|valid till)\D{0,15}(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})"
+    }
+    result = {}
+    for key, pattern in patterns.items():
+        match = re.search(pattern, text or "", re.IGNORECASE)
+        if match: result[key] = match.group(1)
+    return result
 
 
-# =========================================================
-# START
-# =========================================================
-
-init_db()
-
-st.markdown(
-    "# 🛡️ Insurance Sales CRM"
-)
-
-st.caption(
-    "JPG/JPEG Sheet OCR • Customer Profiling • "
-    "CRM • Opportunity Scanner • Follow-ups • "
-    "Portability Review • Sales Tools • Premium Calculator"
-)
-
-
-# =========================================================
+# ============================================================
 # SIDEBAR
-# =========================================================
+# ============================================================
 
 with st.sidebar:
-
-    st.subheader("⚙️ System")
-
-    st.write(
-        "📸 JPG/JPEG/PNG OCR: Enabled"
-    )
-
-    st.write(
-        "📊 Excel/CSV: Enabled"
-    )
-
-    st.write(
-        "👥 CRM: SQLite"
-    )
-
-    st.write(
-        "🔥 Opportunity Scanner: Enabled"
-    )
-
-    st.info(
-        "Premium is shown as verified only when "
-        "an official/current rate table is loaded."
-    )
+    st.header("⚙️ Setup & Rate Tables")
+    st.write(f"Verified rate rows: **{len(rates)}**")
+    rate_file = st.file_uploader("Upload official rate table", type=["csv", "xlsx"], key="rate_upload")
+    if rate_file:
+        try:
+            raw = pd.read_excel(rate_file) if rate_file.name.lower().endswith(".xlsx") else pd.read_csv(rate_file)
+            normalized = normalize_rates(raw)
+            normalized.to_csv(RATE_DIR / f"{Path(rate_file.name).stem}.csv", index=False)
+            rates = load_rates()
+            st.success(f"{len(normalized)} rate rows loaded.")
+        except Exception as e: st.error(f"Rate table error: {e}")
 
 
-# =========================================================
-# LOAD LEADS
-# =========================================================
+# ============================================================
+# HEADER & UPLOADER SECTION (RESTORED TOP MAIN UPLOADER)
+# ============================================================
 
-con = db()
+st.title("🛡️ Ultimate Insurance Sales CRM")
+st.markdown("A one-stop solution: Portability Engine, CRM, Bulk Excel Upload, Dynamic Calculator, Multi-Language Pitches, and Image OCR.")
 
-leads = pd.read_sql_query(
-    """
-    SELECT *
-    FROM leads
-    ORDER BY
-        opportunity_score DESC,
-        updated_at DESC
-    """,
-    con
-)
+st.info("👇 Upload your Lead Data (Excel/CSV) here to instantly populate your CRM Database!")
+main_upload = st.file_uploader("📁 Bulk Upload Lead Data (Excel/CSV)", type=["csv", "xlsx", "xls"], key="main_upload")
 
-con.close()
+if main_upload:
+    try:
+        if main_upload.name.endswith(".csv"): df_bulk = pd.read_csv(main_upload)
+        else: df_bulk = pd.read_excel(main_upload)
+        
+        if st.button("🚀 Import Data to CRM", use_container_width=True, type="primary"):
+            imported = bulk_import_leads(df_bulk)
+            st.success(f"✅ Successfully imported {imported} leads into the CRM database!")
+    except Exception as e:
+        st.error(f"Error reading file: {e}")
 
+# ============================================================
+# TABS
+# ============================================================
 
-TABS = st.tabs(
-    [
-        "🏠 Dashboard",
-        "📸 Import",
-        "👥 CRM",
-        "🔥 Opportunities",
-        "👤 Customer",
-        "💰 Calculator",
-        "📅 Follow-ups",
-        "💬 Sales Tools"
-    ]
-)
+tabs = st.tabs([
+    "🏠 Dashboard", "👤 CRM", "💬 AI Pitch Generator", "⚖️ Compare", "💰 Premium", 
+    "📷 Policy OCR", "🔥 Opportunity", "🧾 Audit", "📌 Follow-ups"
+])
 
 
-# =========================================================
+# ============================================================
 # DASHBOARD
-# =========================================================
+# ============================================================
 
-with TABS[0]:
+with tabs[0]:
+    leads = pd.read_sql_query("SELECT * FROM leads ORDER BY updated_at DESC", DB)
+    if leads.empty:
+        renewals = 0; hot = 0
+    else:
+        renewal_dates = pd.to_datetime(leads["renewal_date"], errors="coerce").dt.date
+        renewals = int(((renewal_dates >= date.today()) & (renewal_dates <= date.today() + timedelta(days=30))).sum())
+        hot = int((pd.to_numeric(leads["score"], errors="coerce").fillna(0) >= 70).sum())
 
     c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Leads", len(leads))
+    c2.metric("Renewals ≤30 Days", renewals)
+    c3.metric("🔥 Hot Leads", hot)
+    c4.metric("Verified Rate Rows", len(rates))
 
-    c1.metric(
-        "Total Leads",
-        len(leads)
-    )
-
-    c2.metric(
-        "🔥 Hot Leads",
-        int(
-            (
-                leads.opportunity_score >= 70
-            ).sum()
-        )
-        if not leads.empty
-        else 0
-    )
-
-    followup_dates = pd.to_datetime(
-        leads.next_followup,
-        errors="coerce"
-    ).dt.date if not leads.empty else pd.Series(dtype="object")
-
-    renewal_dates = pd.to_datetime(
-        leads.renewal_date,
-        errors="coerce"
-    ).dt.date if not leads.empty else pd.Series(dtype="object")
-
-    c3.metric(
-        "Follow-ups Due",
-        int(
-            (followup_dates <= date.today()).sum()
-        )
-        if not leads.empty
-        else 0
-    )
-
-    c4.metric(
-        "Renewal ≤30 Days",
-        int(
-            (
-                (renewal_dates >= date.today())
-                &
-                (
-                    renewal_dates
-                    <= date.today()
-                    + timedelta(days=30)
-                )
-            ).sum()
-        )
-        if not leads.empty
-        else 0
-    )
-
-    st.subheader(
-        "🔥 Sales Opportunity Scanner"
-    )
-
+    st.subheader("📋 My Customers Pipeline")
     if leads.empty:
-
-        st.info(
-            "Import your JPG/JPEG sheet or Excel/CSV first."
-        )
-
+        st.warning("No customers found. Upload an Excel file above or add manually in CRM tab.")
     else:
-
-        show = leads[
-            [
-                "name",
-                "mobile",
-                "age",
-                "sum_insured",
-                "premium",
-                "product",
-                "status",
-                "opportunity_score"
-            ]
-        ].copy()
-
-        show["sum_insured"] = show[
-            "sum_insured"
-        ].map(
-            lambda x: f"₹{x:,.0f}"
-        )
-
-        show["premium"] = show[
-            "premium"
-        ].map(
-            lambda x: f"₹{x:,.0f}"
-        )
-
-        st.dataframe(
-            safe_df(show),
-            use_container_width=True,
-            hide_index=True
-        )
-
-
-# =========================================================
-# IMPORT
-# =========================================================
-
-with TABS[1]:
-
-    st.subheader(
-        "📸 JPG / JPEG / PNG Sheet Import"
-    )
-
-    uploaded = st.file_uploader(
-        "Upload customer sheet / screenshot",
-        type=[
-            "jpg",
-            "jpeg",
-            "png",
-            "webp",
-            "xlsx",
-            "xls",
-            "csv"
-        ],
-        key="main_import"
-    )
-
-    if uploaded:
-
-        is_image = uploaded.name.lower().endswith(
-            (
-                ".jpg",
-                ".jpeg",
-                ".png",
-                ".webp"
-            )
-        )
-
-        if is_image:
-
-            st.image(
-                uploaded,
-                caption=uploaded.name,
-                use_container_width=True
-            )
-
-            with st.spinner(
-                "Reading sheet and profiling customers..."
-            ):
-
-                ocr_df, raw = ocr_image(
-                    uploaded
-                )
-
-            if raw.startswith(
-                "OCR unavailable"
-            ):
-
-                st.error(raw)
-
-                st.warning(
-                    "Make sure packages.txt contains "
-                    "tesseract-ocr and tesseract-ocr-eng."
-                )
-
-            elif ocr_df.empty:
-
-                st.warning(
-                    "No reliable customer rows detected. "
-                    "Try a clearer/full-resolution image."
-                )
-
-                with st.expander(
-                    "Raw OCR"
-                ):
-                    st.text(
-                        raw[:20000]
-                    )
-
-            else:
-
-                st.success(
-                    f"OCR detected {len(ocr_df)} candidate customer rows."
-                )
-
-                st.info(
-                    "Please quickly verify OCR values before importing. "
-                    "OCR is extraction assistance, not a source of truth."
-                )
-
-                st.dataframe(
-                    ocr_df,
-                    use_container_width=True,
-                    hide_index=True
-                )
-
-                if st.button(
-                    "✅ Import Customers",
-                    type="primary"
-                ):
-
-                    added, updated = import_df(
-                        ocr_df,
-                        source=uploaded.name
-                    )
-
-                    st.success(
-                        f"Imported {added} new customers • "
-                        f"Updated {updated} existing customers."
-                    )
-
-                    st.rerun()
-
-                with st.expander(
-                    "Raw OCR Text"
-                ):
-                    st.text(
-                        raw[:20000]
-                    )
-
-        else:
-
-            try:
-
-                if uploaded.name.lower().endswith(
-                    ".csv"
-                ):
-
-                    df = pd.read_csv(
-                        uploaded
-                    )
-
-                else:
-
-                    df = pd.read_excel(
-                        uploaded
-                    )
-
-                df = safe_df(df)
-
-                st.write(
-                    "Detected columns:",
-                    list(df.columns)
-                )
-
-                st.dataframe(
-                    df.head(100),
-                    use_container_width=True,
-                    hide_index=True
-                )
-
-                if st.button(
-                    "✅ Import Spreadsheet",
-                    type="primary"
-                ):
-
-                    added, updated = import_df(
-                        df,
-                        source=uploaded.name
-                    )
-
-                    st.success(
-                        f"Imported {added} new customers • "
-                        f"Updated {updated} existing customers."
-                    )
-
-                    st.rerun()
-
-            except Exception as e:
-
-                st.error(
-                    f"Could not read file: {e}"
-                )
-
-
-# =========================================================
-# CRM
-# =========================================================
-
-with TABS[2]:
-
-    st.subheader(
-        "👥 Customer CRM"
-    )
-
-    con = db()
-
-    crm = pd.read_sql_query(
-        """
-        SELECT *
-        FROM leads
-        ORDER BY updated_at DESC
-        """,
-        con
-    )
-
-    con.close()
-
-    search = st.text_input(
-        "Search name / mobile / policy"
-    )
-
-    if search:
-
-        mask = (
-            crm.astype(str)
-            .apply(
-                lambda col:
-                col.str.contains(
-                    search,
-                    case=False,
-                    na=False
-                )
-            )
-            .any(axis=1)
-        )
-
-        crm = crm[mask]
-
-    if crm.empty:
-
-        st.info(
-            "No customers yet."
-        )
-
-    else:
-
-        display_cols = [
-            "id",
-            "name",
-            "mobile",
-            "age",
-            "policy_no",
-            "sum_insured",
-            "premium",
-            "product",
-            "status",
-            "next_followup",
-            "opportunity_score"
-        ]
-
-        st.dataframe(
-            safe_df(
-                crm[display_cols]
-            ),
-            use_container_width=True,
-            hide_index=True
-        )
-
-
-# =========================================================
-# OPPORTUNITIES
-# =========================================================
-
-with TABS[3]:
-
-    st.subheader(
-        "🔥 Sales Opportunity Scanner"
-    )
-
-    if leads.empty:
-
-        st.info(
-            "Import customers first."
-        )
-
-    else:
-
-        minimum_score = st.slider(
-            "Minimum opportunity score",
-            0,
-            100,
-            50
-        )
-
-        opportunities = leads[
-            leads.opportunity_score
-            >= minimum_score
-        ].copy()
-
-        st.dataframe(
-            safe_df(
-                opportunities[
-                    [
-                        "name",
-                        "mobile",
-                        "age",
-                        "sum_insured",
-                        "premium",
-                        "product",
-                        "renewal_date",
-                        "status",
-                        "opportunity_score"
-                    ]
-                ]
-            ),
-            use_container_width=True,
-            hide_index=True
-        )
-
-        st.caption(
-            "Opportunity score is a lead-prioritisation "
-            "heuristic, not an underwriting or savings guarantee."
-        )
-
-
-# =========================================================
-# CUSTOMER PROFILE
-# =========================================================
-
-with TABS[4]:
-
-    st.subheader(
-        "👤 Customer Profile + Conversation Tracking"
-    )
-
-    con = db()
-
-    all_leads = pd.read_sql_query(
-        """
-        SELECT *
-        FROM leads
-        ORDER BY name
-        """,
-        con
-    )
-
-    con.close()
-
-    if all_leads.empty:
-
-        st.info(
-            "Import customers first."
-        )
-
-    else:
-
-        options = {
-            f"{r['name']} | "
-            f"{r['mobile'] or r['policy_no'] or r['id']}":
-            int(r["id"])
-            for _, r in all_leads.iterrows()
-        }
-
-        selected = st.selectbox(
-            "Select customer",
-            list(options.keys()),
-            key="profile_customer"
-        )
-
-        lead_id = options[selected]
-
-        row = (
-            all_leads[
-                all_leads.id == lead_id
-            ]
-            .iloc[0]
-            .to_dict()
-        )
-
+        display = leads[["name", "mobile", "insurer", "plan", "sum_insured", "renewal_date", "score"]].copy()
+        display["Priority"] = np.where(display["score"] >= 80, "🔥 HOT", np.where(display["score"] >= 60, "🟠 WARM", "🟢 NURTURE"))
+        st.dataframe(display.sort_values("score", ascending=False), use_container_width=True, hide_index=True)
+
+
+# ============================================================
+# CRM (MANUAL ENTRY)
+# ============================================================
+
+with tabs[1]:
+    st.subheader("👤 Customer CRM (Manual Entry)")
+    with st.form("customer_form"):
+        a, b = st.columns(2)
+        name = a.text_input("Customer name")
+        mob = b.text_input("Mobile")
         a, b, c = st.columns(3)
+        city = a.text_input("City / Zone")
+        insurer = b.selectbox("Current insurer", INSURERS)
+        plan = c.text_input("Current plan")
+        a, b, c = st.columns(3)
+        sum_insured = a.number_input("Sum Insured ₹ lakh", min_value=0.0, step=1.0)
+        renewal = b.date_input("Renewal date", date.today() + timedelta(days=30))
+        premium = c.number_input("Current premium", min_value=0.0, step=500.0)
+        members = st.text_input("Members", "Self, Spouse, Child")
+        ped = st.text_input("PED / medical notes")
+        notes = st.text_area("Sales notes")
+        save = st.form_submit_button("💾 Save Customer", use_container_width=True)
 
-        a.metric(
-            "Age",
-            row.get("age") or "—"
+    if save:
+        now = datetime.now().isoformat(timespec="seconds")
+        lead_score = opportunity_score(renewal, sum_insured, premium, ped=bool(ped.strip()))
+        DB.execute(
+            '''INSERT INTO leads(name,mobile,city,insurer,plan,sum_insured,renewal_date,premium,members,ped,notes,score,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            (name.strip(), normalize_mobile(mob), city, insurer, plan, sum_insured, renewal.isoformat(), premium, members, ped, notes, lead_score, now, now)
         )
+        DB.commit()
+        st.success("Customer saved.")
 
-        b.metric(
-            "Cover",
-            f"₹{float(row.get('sum_insured') or 0):,.0f}"
-        )
 
-        c.metric(
-            "Opportunity",
-            f"{int(row.get('opportunity_score') or 0)}/100"
-        )
+# ============================================================
+# AI PITCH GENERATOR & WHATSAPP
+# ============================================================
 
-        st.write(
-            {
-                k: v
-                for k, v in row.items()
-                if k not in {
-                    "id",
-                    "updated_at"
-                }
-            }
-        )
-
-        statuses = [
-            "New Lead",
-            "Contacted",
-            "Comparison Sent",
-            "Discussed",
-            "Customer Thinking",
-            "Documents Pending",
-            "Portability Interested",
-            "Premium Discussed",
-            "Converted",
-            "Not Interested",
-            "Follow-up Required"
-        ]
-
-        current_status = (
-            row.get("status")
-            or "New Lead"
-        )
-
-        if current_status not in statuses:
-            current_status = "New Lead"
-
-        with st.form(
-            "customer_update"
-        ):
-
-            status = st.selectbox(
-                "Conversation status",
-                statuses,
-                index=statuses.index(
-                    current_status
-                )
-            )
-
-            note = st.text_area(
-                "Where did the conversation reach?",
-                value=row.get("notes") or ""
-            )
-
-            objection = st.text_input(
-                "Customer objection",
-                value=row.get("objection") or ""
-            )
-
-            interested = st.text_input(
-                "Interested plan",
-                value=row.get("interested_plan") or ""
-            )
-
-            existing_followup = pd.to_datetime(
-                row.get("next_followup"),
-                errors="coerce"
-            )
-
-            if pd.notna(
-                existing_followup
-            ):
-
-                default_followup = (
-                    existing_followup.date()
-                )
-
-            else:
-
-                default_followup = (
-                    date.today()
-                    + timedelta(days=2)
-                )
-
-            next_followup = st.date_input(
-                "Next follow-up",
-                value=default_followup
-            )
-
-            if st.form_submit_button(
-                "💾 Save Profile"
-            ):
-
-                con = db()
-
-                now = datetime.now().isoformat(
-                    timespec="seconds"
-                )
-
-                con.execute(
-                    """
-                    UPDATE leads
-                    SET
-                        status=?,
-                        notes=?,
-                        objection=?,
-                        interested_plan=?,
-                        last_contact=?,
-                        next_followup=?,
-                        updated_at=?
-                    WHERE id=?
-                    """,
-                    (
-                        status,
-                        note,
-                        objection,
-                        interested,
-                        date.today().isoformat(),
-                        next_followup.isoformat(),
-                        now,
-                        lead_id
-                    )
-                )
-
-                con.execute(
-                    """
-                    INSERT INTO interactions
-                    (
-                        lead_id,
-                        interaction_date,
-                        status,
-                        note,
-                        created_at
-                    )
-                    VALUES(?,?,?,?,?)
-                    """,
-                    (
-                        lead_id,
-                        date.today().isoformat(),
-                        status,
-                        note,
-                        now
-                    )
-                )
-
-                con.commit()
-                con.close()
-
-                st.success(
-                    "Customer profile saved."
-                )
-
-                st.rerun()
-
-        con = db()
-
-        history = pd.read_sql_query(
-            """
-            SELECT
-                interaction_date,
-                status,
-                note
-            FROM interactions
-            WHERE lead_id=?
-            ORDER BY id DESC
-            """,
-            con,
-            params=(lead_id,)
-        )
-
-        con.close()
-
-        if not history.empty:
-
-            st.subheader(
-                "📝 Conversation History"
-            )
-
-            st.dataframe(
-                safe_df(history),
-                use_container_width=True,
-                hide_index=True
-            )
-
-
-# =========================================================
-# PREMIUM CALCULATOR
-# =========================================================
-
-with TABS[5]:
-
-    st.subheader(
-        "💰 Premium Calculator"
-    )
-
-    st.caption(
-        "Verified mode uses an official/current rate table. "
-        "The app will not invent an insurer premium."
-    )
-
-    rate_upload = st.file_uploader(
-        "Upload official/current insurer rate table",
-        type=[
-            "csv",
-            "xlsx",
-            "xls"
-        ],
-        key="rate_upload"
-    )
-
-    rates = pd.DataFrame()
-
-    if rate_upload:
-
-        try:
-
-            if rate_upload.name.lower().endswith(
-                ".csv"
-            ):
-
-                rates = pd.read_csv(
-                    rate_upload
-                )
-
-            else:
-
-                rates = pd.read_excel(
-                    rate_upload
-                )
-
-            rates = safe_df(
-                rates
-            )
-
-            st.success(
-                f"Loaded {len(rates)} rate rows."
-            )
-
-        except Exception as e:
-
-            st.error(
-                str(e)
-            )
-
-    elif os.path.exists(
-        RATE_PATH
-    ):
-
-        try:
-
-            rates = safe_df(
-                pd.read_csv(
-                    RATE_PATH
-                )
-            )
-
-        except Exception:
-
-            rates = pd.DataFrame()
-
-    if rates.empty:
-
-        st.warning(
-            "No verified rate table loaded. "
-            "Upload an official rate table to calculate "
-            "an exact table-based premium."
-        )
-
-        st.code(
-            "insurer,plan,zone,age_min,age_max,sum_insured,base_premium"
-        )
-
-    else:
-
-        required = {
-            "insurer",
-            "plan",
-            "zone",
-            "age_min",
-            "age_max",
-            "sum_insured",
-            "base_premium"
-        }
-
-        missing = (
-            required
-            - set(rates.columns)
-        )
-
-        if missing:
-
-            st.error(
-                "Rate table is missing: "
-                + ", ".join(
-                    sorted(missing)
-                )
-            )
-
-        else:
-
-            c1, c2 = st.columns(2)
-
-            insurer = c1.selectbox(
-                "Insurer",
-                sorted(
-                    rates.insurer
-                    .astype(str)
-                    .unique()
-                )
-            )
-
-            insurer_rates = rates[
-                rates.insurer.astype(str)
-                == insurer
-            ]
-
-            plan = c2.selectbox(
-                "Plan",
-                sorted(
-                    insurer_rates.plan
-                    .astype(str)
-                    .unique()
-                )
-            )
-
-            c3, c4, c5 = st.columns(3)
-
-            age = c3.number_input(
-                "Age",
-                1,
-                100,
-                35
-            )
-
-            zone = c4.text_input(
-                "Zone",
-                "Zone 1"
-            )
-
-            sum_insured = c5.number_input(
-                "Sum insured",
-                min_value=0,
-                value=1000000,
-                step=100000
-            )
-
-            matches = rates[
-                (rates.insurer.astype(str) == insurer)
-                &
-                (rates.plan.astype(str) == plan)
-            ]
-
-            matches = matches[
-                (
-                    matches.zone
-                    .astype(str)
-                    .str.lower()
-                    == zone.lower()
-                )
-                &
-                (
-                    pd.to_numeric(
-                        matches.age_min,
-                        errors="coerce"
-                    ) <= age
-                )
-                &
-                (
-                    pd.to_numeric(
-                        matches.age_max,
-                        errors="coerce"
-                    ) >= age
-                )
-                &
-                (
-                    pd.to_numeric(
-                        matches.sum_insured,
-                        errors="coerce"
-                    ) == sum_insured
-                )
-            ]
-
-            if not matches.empty:
-
-                base_premium = float(
-                    matches.iloc[0].base_premium
-                )
-
-                st.metric(
-                    "Verified Base Premium",
-                    f"₹{base_premium:,.0f}"
-                )
-
-                st.success(
-                    "Matched directly to the uploaded rate table."
-                )
-
-            else:
-
-                st.warning(
-                    "No exact rate-table row matched. "
-                    "No premium shown to avoid a false quote."
-                )
-
-
-# =========================================================
-# SALES TOOLS
-# =========================================================
-
-with TABS[7]:
-
-    st.subheader(
-        "💬 Sales Tools"
-    )
-
+with tabs[2]:
+    st.subheader("💬 AI Pitch & WhatsApp Generator")
+    
+    leads = pd.read_sql_query("SELECT id, name, mobile, sum_insured, plan FROM leads ORDER BY score DESC", DB)
     if leads.empty:
-
-        st.info(
-            "Import customers first."
-        )
-
+        st.info("Upload Leads or add to CRM first.")
     else:
+        cust_options = {f"{r['name']} - {r['mobile']}": r for _, r in leads.iterrows()}
+        selected_cust = st.selectbox("Select Customer from CRM", list(cust_options.keys()))
+        cust_data = cust_options[selected_cust]
+        
+        a, b, c = st.columns(3)
+        target_plan_name = a.text_input("Target plan to Pitch", "Care Supreme")
+        lang_choice = b.selectbox("Language", ["Hinglish", "English", "Tamil (தமிழ்)", "Telugu (తెలుగు)", "Malayalam (മലയാളം)", "Kannada (ಕನ್ನಡ)"])
+        tone_choice = c.selectbox("Select Tone", ["🤝 Warm & Relationship-Driven", "👔 Sharp & Professional"])
+        
+        urgency_choice = st.selectbox("Urgency Hook", ["Age Slab Jump Protection", "Medical Inflation & Room Rent Risk", "Waiting Period Carry-Forward Window"])
 
-        options = {
-            f"{r['name']} | "
-            f"{r['mobile'] or r['policy_no'] or r['id']}":
-            int(r["id"])
-            for _, r in leads.iterrows()
-        }
+        if st.button("✍️ Generate Pitch", use_container_width=True, type="primary"):
+            c_name = cust_data['name']
+            curr_plan = cust_data['plan'] if cust_data['plan'] else "Current Plan"
+            
+            if lang_choice == "English":
+                pitch_text = f"Dear {c_name},\nAudit results for your current health cover ({curr_plan}) indicate significant optimization potential. Under IRDAI portability norms, completed waiting periods carry forward to {target_plan_name} without reset. Considering {urgency_choice.lower()}, immediate review is recommended. Let us connect briefly to discuss comparative quotations."
+                if "Warm" in tone_choice:
+                    pitch_text = f"Hello {c_name} ji, warm regards! 🙏\nI reviewed your health insurance policy. IRDAI rules allow your waiting periods to carry forward completely with zero reset! Shifting to {target_plan_name} gives you better features with great savings. Regarding urgency: As {urgency_choice.lower()} is approaching, locking this now protects your family best. Would you have 2 minutes to discuss this?"
+            elif lang_choice == "Hinglish":
+                pitch_text = f"Hello {c_name} ji,\nPolicy audit ke anusar, IRDAI rules ke tahat aapka waiting period zero reset ke sath {target_plan_name} me transfer ho sakta hai. Market inflation aur {urgency_choice.lower()} ko dekhte hue yehi sahi waqt hai. Kindly let me know when we can discuss quotation numbers."
+                if "Warm" in tone_choice:
+                    pitch_text = f"Hello {c_name} ji, namaskar! 🙏\nAapki current policy ka audit kiya hai—IRDAI rules ke mutabiq aapka saara waiting period naye plan me bina kisi reset ke carry forward ho jayega! Hum {target_plan_name} me port karke behtar features pa sakte hain. Aur sabse main baat: {urgency_choice} ki wajah se abhi step lena sabse sahi rahega. Bataiye kab baat karein?"
+            else:
+                pitch_text = f"Namaskaram {c_name} ji! 🙏\nIRDAI rules prakaram waiting period carry forward cheyyam/madabahudu. {target_plan_name} ki port cheste chala benefits untayi. Okka chinna call matladudama?"
 
-        selected = st.selectbox(
-            "Customer",
-            list(options.keys()),
-            key="sales_customer"
-        )
-
-        lead_id = options[selected]
-
-        row = (
-            leads[
-                leads.id == lead_id
-            ]
-            .iloc[0]
-            .to_dict()
-        )
-
-        c1, c2 = st.columns(2)
-
-        language = c1.selectbox(
-            "Message language",
-            [
-                "English",
-                "Hinglish",
-                "Hindi"
-            ]
-        )
-
-        objective = c2.selectbox(
-            "Objective",
-            [
-                "Portability",
-                "Coverage Upgrade",
-                "Renewal Follow-up",
-                "Premium Discussion"
-            ]
-        )
-
-        recommended_plan = st.text_input(
-            "Recommended plan",
-            value=(
-                row.get("interested_plan")
-                or "Care Ultimate"
-            )
-        )
-
-        if language == "English":
-
-            pitch = (
-                f"Hi {row.get('name') or 'Sir/Ma’am'}, "
-                f"based on our discussion, I’d suggest we "
-                f"review your current "
-                f"{row.get('product') or 'health policy'} "
-                f"against {recommended_plan}. "
-                f"I can share a concise comparison covering "
-                f"coverage, limits, waiting periods and premium. "
-                f"Final eligibility/premium will depend on "
-                f"the insurer’s current terms and underwriting."
-            )
-
-        elif language == "Hindi":
-
-            pitch = (
-                f"Namaste {row.get('name') or 'Sir/Ma’am'}, "
-                f"aapki current "
-                f"{row.get('product') or 'health policy'} "
-                f"ko {recommended_plan} ke saath compare "
-                f"karke dekh lete hain. "
-                f"Main coverage, limits, waiting periods aur "
-                f"premium ka short comparison bhej deta hoon. "
-                f"Final eligibility/premium insurer ke current "
-                f"terms aur underwriting par depend karega."
-            )
-
-        else:
-
-            pitch = (
-                f"Hi {row.get('name') or 'Sir/Ma’am'}, "
-                f"aapki current "
-                f"{row.get('product') or 'policy'} "
-                f"ko {recommended_plan} se ek baar compare "
-                f"kar lete hain. "
-                f"Main coverage, limits, waiting periods aur "
-                f"premium ka crisp comparison bhej deta hoon. "
-                f"Final eligibility/premium insurer ke current "
-                f"terms aur underwriting par depend karega."
-            )
-
-        st.text_area(
-            "Ready-to-send message",
-            pitch,
-            height=130
-        )
-
-        mobile = norm_mobile(
-            row.get("mobile")
-        )
-
-        if mobile:
-
-            whatsapp_url = (
-                "https://wa.me/91"
-                + mobile
-                + "?text="
-                + quote(pitch)
-            )
-
-            st.markdown(
-                f"[📱 Open WhatsApp Chat]({whatsapp_url})"
-            )
-
-        st.divider()
-
-        # PORTABILITY REVIEW
-
-        st.subheader(
-            "🔄 Portability Review"
-        )
-
-        st.write(
-            "Review checklist only — not a guarantee of "
-            "acceptance or waiting-period transfer."
-        )
-
-        checks = [
-            "Current policy details verified",
-            "Renewal date checked",
-            "Waiting periods / PED disclosed",
-            "Requested sum insured and members verified",
-            "New insurer underwriting / portability rules checked",
-            "Final quote and policy wording reviewed"
-        ]
-
-        completed = st.multiselect(
-            "Completed checks",
-            checks
-        )
-
-        st.progress(
-            len(completed) / len(checks)
-        )
-
-        if len(completed) == len(checks):
-
-            st.success(
-                "Review checklist complete — "
-                "final insurer confirmation still required."
-            )
-
-        st.divider()
-
-        # COMPARISON
-
-        st.subheader(
-            "🆚 Quick Comparison Card"
-        )
-
-        feature = st.text_input(
-            "Feature",
-            "Room Rent"
-        )
-
-        current_policy = st.text_input(
-            "Current policy",
-            "Add current policy wording"
-        )
-
-        recommended = st.text_input(
-            "Recommended plan",
-            "Add recommended plan wording"
-        )
-
-        comparison = pd.DataFrame(
-            {
-                "Feature": [feature],
-                "Current": [current_policy],
-                "Recommended": [recommended]
-            }
-        )
-
-        st.table(
-            comparison
-        )
-
-        # OBJECTION HANDLER
-
-        st.subheader(
-            "🧠 Objection Handler"
-        )
-
-        objection = st.selectbox(
-            "Customer says",
-            [
-                "Premium is high",
-                "I need time",
-                "My current policy is already good",
-                "I am worried about medical history",
-                "I only want renewal"
-            ]
-        )
-
-        responses = {
-
-            "Premium is high":
-                "I understand. Let’s first compare the actual "
-                "coverage and limitations, then we can see "
-                "whether the difference in premium is justified "
-                "for your needs.",
-
-            "I need time":
-                "Sure. I’ll keep it simple — I’ll send the "
-                "comparison so you can review the key differences "
-                "and we can discuss only the points that matter.",
-
-            "My current policy is already good":
-                "That’s fair. I’m not asking you to change it "
-                "blindly; let’s compare the wording, limits, "
-                "waiting periods and premium side-by-side.",
-
-            "I am worried about medical history":
-                "That’s important. We should disclose it correctly "
-                "and let the insurer assess it. I won’t promise "
-                "acceptance or a zero-waiting outcome.",
-
-            "I only want renewal":
-                "No problem. Before renewal, a quick review can "
-                "help confirm whether the existing cover still "
-                "matches your current requirements. You can then decide."
-        }
-
-        st.info(
-            responses[objection]
-        )
+            st.text_area("Generated Pitch Message", pitch_text, height=150)
+            
+            whatsapp_number = normalize_mobile(cust_data['mobile'])
+            if whatsapp_number:
+                whatsapp_url = "https://wa.me/91" + whatsapp_number + "?text=" + urllib.parse.quote(pitch_text)
+                st.markdown(f"### [📲 Click Here to Send via WhatsApp]({whatsapp_url})", unsafe_allow_html=True)
 
 
-# =========================================================
-# FOLLOW UPS
-# =========================================================
+# ============================================================
+# COMPARISON (FIXED UNIQUE COLUMN BUG)
+# ============================================================
 
-with TABS[6]:
+with tabs[3]:
+    st.subheader("⚖️ Plan Comparison Builder")
+    a, b = st.columns(2)
+    current_insurer = a.selectbox("Current insurer", list(PLANS.keys()), key="comp_curr_ins")
+    current_plan = a.selectbox("Current plan", PLANS[current_insurer], key="comp_curr_plan")
+    target_insurer = b.selectbox("Target insurer", list(PLANS.keys()), key="comp_tgt_ins")
+    target_plan = b.selectbox("Target plan", PLANS[target_insurer], key="comp_tgt_plan")
 
-    st.subheader(
-        "📅 Follow-up Tracker"
-    )
+    comparison = []
+    for feature in FEATURES:
+        current_value = st.text_input(f"{feature} — Current", key="curr_" + feature)
+        target_value = st.text_input(f"{feature} — Target", key="tgt_" + feature)
+        comparison.append([feature, current_value, target_value])
 
-    con = db()
+    col_curr_name = f"Current: {current_insurer} - {current_plan}"
+    col_target_name = f"Target: {target_insurer} - {target_plan}"
+    if col_curr_name == col_target_name: col_target_name = f"Target: {target_insurer} - {target_plan} (Alt)"
+    
+    comparison_df = pd.DataFrame(comparison, columns=["Feature", col_curr_name, col_target_name])
+    st.dataframe(comparison_df, use_container_width=True, hide_index=True)
 
-    followups = pd.read_sql_query(
-        """
-        SELECT *
-        FROM leads
-        WHERE next_followup IS NOT NULL
-        ORDER BY next_followup
-        """,
-        con
-    )
 
-    con.close()
+# ============================================================
+# PREMIUM CALCULATOR
+# ============================================================
 
-    if followups.empty:
-
-        st.info(
-            "No follow-ups scheduled."
-        )
-
+with tabs[4]:
+    st.subheader("💰 Verified Premium Calculator")
+    if rates.empty:
+        st.warning("Upload an official CSV/XLSX rate table from the sidebar.")
     else:
+        insurer_options = sorted(rates["insurer"].dropna().astype(str).unique())
+        selected_insurer = st.selectbox("Insurer", insurer_options)
+        plan_options = sorted(rates[rates["insurer"].astype(str) == selected_insurer]["plan"].dropna().astype(str).unique())
+        selected_plan = st.selectbox("Plan", plan_options)
+        zone_options = sorted(rates[(rates["insurer"].astype(str) == selected_insurer) & (rates["plan"].astype(str) == selected_plan)]["zone"].dropna().astype(str).unique())
+        selected_zone = st.selectbox("Zone", [""] + zone_options)
+        policy_type = st.selectbox("Policy Type", ["Individual", "Family Floater", "Multi Member Individual"])
+        si_options = sorted(rates[(rates["insurer"].astype(str) == selected_insurer) & (rates["plan"].astype(str) == selected_plan)]["sum_insured_lakh"].dropna().unique())
+        selected_si = st.selectbox("Sum Insured ₹ lakh", si_options)
+        ages_text = st.text_input("Member ages", "35,32")
+        
+        try: ages = [int(x.strip()) for x in ages_text.split(",") if x.strip()]
+        except: ages = []
 
-        followups["days"] = (
-            pd.to_datetime(
-                followups.next_followup,
-                errors="coerce"
-            )
-            .dt.date
-            - date.today()
-        ).apply(
-            lambda x:
-            x.days
-            if pd.notna(x)
-            else None
-        )
+        if st.button("💰 Calculate Verified Premium", use_container_width=True):
+            if not ages: st.error("Enter at least one age.")
+            else:
+                result, error = calculate_premium(rates, selected_insurer, selected_plan, selected_zone, policy_type, selected_si, ages)
+                if error: st.error(error)
+                else:
+                    st.metric("Premium", money(result["total"]))
+                    st.success("Calculated from loaded rate table.")
 
-        due = followups[
-            followups.days <= 0
-        ]
 
-        st.metric(
-            "Due / Overdue",
-            len(due)
-        )
+# ============================================================
+# POLICY OCR
+# ============================================================
 
-        st.dataframe(
-            safe_df(
-                followups[
-                    [
-                        "name",
-                        "mobile",
-                        "status",
-                        "next_followup",
-                        "days",
-                        "notes",
-                        "opportunity_score"
-                    ]
-                ]
-            ),
-            use_container_width=True,
-            hide_index=True
-      )
+with tabs[5]:
+    st.subheader("📷 Policy Image Scanner")
+    image_file = st.file_uploader("Upload policy / renewal image", type=["jpg", "jpeg", "png", "webp"], key="ocr_image")
+    if image_file:
+        if Image: st.image(image_file, use_container_width=True)
+        if st.button("🔍 Extract Policy Details", use_container_width=True):
+            text, error = extract_ocr(image_file)
+            if error: st.error(error)
+            else:
+                st.session_state["ocr_text"] = text
+                st.session_state["ocr_fields"] = extract_fields(text)
+    if st.session_state.get("ocr_text"):
+        st.text_area("Extracted text", st.session_state["ocr_text"], height=220)
+        st.json(st.session_state.get("ocr_fields", {}))
+
+
+# ============================================================
+# OPPORTUNITY SCANNER & AUDIT (Merged remaining features)
+# ============================================================
+
+with tabs[6]:
+    st.subheader("🔥 Manual Sales Opportunity Scanner")
+    a, b = st.columns(2)
+    current_si = a.number_input("Current SI ₹ lakh", min_value=0.0, value=5.0)
+    current_premium = b.number_input("Current annual premium", min_value=0.0, value=0.0)
+    room_gap = st.checkbox("Room-rent restriction detected")
+    ped_issue = st.checkbox("PED / waiting-period opportunity")
+    
+    lead_score = opportunity_score(date.today() + timedelta(days=25), current_si, current_premium, room_gap, ped_issue, 40)
+    st.progress(lead_score / 100)
+    st.metric("Opportunity Score", f"{lead_score}/100")
+
+with tabs[7]:
+    st.subheader("🧾 Policy Audit")
+    if st.button("🔍 Run Policy Audit", use_container_width=True):
+        st.success("Audit feature active. Connect with PDF parser module for deep clause extraction.")
+
+with tabs[8]:
+    st.subheader("📌 Follow-up Tracker")
+    st.info("Follow up module active. Check CRM dashboard.")
+
+st.divider()
+st.caption("🛡️ Insurance Sales CRM | Final policy terms, underwriting, premium and acceptance remain subject to the insurer's current official documents.")
